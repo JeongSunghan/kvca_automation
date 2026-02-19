@@ -31,6 +31,7 @@ kvca-automation/
   .gitignore
   docs/
     ARCHITECTURE.md
+    API_SPEC.md
     DATA_CONTRACT.md
     DECISIONS.md
     RUNBOOK.md
@@ -46,6 +47,7 @@ kvca-automation/
 ## 문서 모음
 
 - 아키텍처: `docs/ARCHITECTURE.md`
+- API 스펙(초안): `docs/API_SPEC.md`
 - 데이터 계약: `docs/DATA_CONTRACT.md`
 - 결정 사항: `docs/DECISIONS.md`
 - 운영 가이드: `docs/RUNBOOK.md`
