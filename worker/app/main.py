@@ -65,5 +65,10 @@ async def run_enrolment_sync(request: SyncRequest) -> dict[str, Any]:
             lock_ttl_seconds=settings.job_lock_ttl_seconds,
         )
         return {"ok": True, "summary": summary_to_dict(summary)}
+    except RuntimeError as exc:
+        message = str(exc)
+        if "job_lock active" in message:
+            raise HTTPException(status_code=409, detail=message) from exc
+        raise HTTPException(status_code=500, detail=f"Sync failed: {message}") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Sync failed: {exc}") from exc
