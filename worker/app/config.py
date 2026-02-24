@@ -79,6 +79,8 @@ class Settings:
     supabase_url: str | None
     supabase_service_role_key: str | None
     supabase_request_timeout_ms: int
+    alert_cooldown_minutes: int
+    job_lock_ttl_seconds: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -101,4 +103,6 @@ class Settings:
             supabase_url=supabase_url,
             supabase_service_role_key=supabase_service_role_key,
             supabase_request_timeout_ms=int(os.getenv("SUPABASE_REQUEST_TIMEOUT_MS", "15000")),
+            alert_cooldown_minutes=int(os.getenv("ALERT_COOLDOWN_MINUTES", "30")),
+            job_lock_ttl_seconds=int(os.getenv("JOB_LOCK_TTL_SECONDS", "900")),
         )

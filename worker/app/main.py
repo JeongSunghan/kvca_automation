@@ -13,7 +13,7 @@ from .sync_service import EnrolmentSyncService, summary_to_dict
 
 
 class SyncRequest(BaseModel):
-    category_id: int | None = Field(default=None, description="고정 category_id 지정")
+    category_id: int = Field(description="실행 시 입력할 category_id")
     max_categories: int | None = Field(default=1, ge=1, le=100)
     max_users_per_course: int | None = Field(default=None, ge=1, le=10000)
 
@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="KVCA Worker",
-    version="0.2.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -56,13 +56,13 @@ async def storage_info() -> dict[str, str]:
 async def run_enrolment_sync(request: SyncRequest) -> dict[str, Any]:
     service: EnrolmentSyncService = app.state.sync_service
     settings: Settings = app.state.settings
-    category_id = request.category_id if request.category_id is not None else settings.kvca_sync_default_category_id
 
     try:
         summary = await service.sync(
-            category_id=category_id,
+            category_id=request.category_id,
             max_categories=request.max_categories,
             max_users_per_course=request.max_users_per_course or settings.kvca_max_users_per_course,
+            lock_ttl_seconds=settings.job_lock_ttl_seconds,
         )
         return {"ok": True, "summary": summary_to_dict(summary)}
     except Exception as exc:

@@ -6,9 +6,11 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
+import httpx
+
 from .kvca_client import KVCAClient
 from .redaction import redact_sensitive
-from .storage import SourceRecordInput, Storage
+from .storage import PersistResult, SourceRecordInput, Storage
 
 
 @dataclass
@@ -18,7 +20,12 @@ class SyncSummary:
     status_rows_processed: int = 0
     details_processed: int = 0
     source_records_upserted: int = 0
+    new_records: int = 0
+    changed_records: int = 0
+    created_alerts: int = 0
     failed_detail_calls: int = 0
+    failed_course_calls: int = 0
+    lock_acquired: bool = False
     started_at: str = ""
     finished_at: str = ""
 
@@ -33,9 +40,16 @@ class EnrolmentSyncService:
         category_id: int | None,
         max_categories: int | None,
         max_users_per_course: int | None,
+        lock_ttl_seconds: int,
     ) -> SyncSummary:
         summary = SyncSummary(started_at=_utc_now())
-        run_id = await self._storage.start_run(job_name="enrolment_sync", trigger_type="MANUAL")
+        job_name = "enrolment_sync"
+        lock_acquired = await self._storage.acquire_job_lock(job_name=job_name, ttl_seconds=lock_ttl_seconds)
+        summary.lock_acquired = lock_acquired
+        if not lock_acquired:
+            raise RuntimeError("Job is already running (job_lock active).")
+
+        run_id = await self._storage.start_run(job_name=job_name, trigger_type="MANUAL")
 
         try:
             categories = await self._resolve_categories(category_id, max_categories)
@@ -43,7 +57,13 @@ class EnrolmentSyncService:
 
             source_records: list[SourceRecordInput] = []
             for term_id in categories:
-                courses = await self._client.fetch_courses_by_category(term_id)
+                try:
+                    courses = await self._client.fetch_courses_by_category(term_id)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code == 409:
+                        summary.failed_course_calls += 1
+                        continue
+                    raise
                 summary.courses_processed += len(courses)
 
                 for course in courses:
@@ -77,7 +97,11 @@ class EnrolmentSyncService:
                         source_records.append(detail_record)
                         summary.details_processed += 1
 
-            summary.source_records_upserted = await self._storage.upsert_source_records(source_records)
+            persist_result: PersistResult = await self._storage.upsert_source_records(source_records)
+            summary.source_records_upserted = persist_result.upserted_count
+            summary.new_records = persist_result.new_count
+            summary.changed_records = persist_result.changed_count
+            summary.created_alerts = persist_result.alert_count
             summary.finished_at = _utc_now()
             await self._storage.finish_run(
                 run_id=run_id,
@@ -95,6 +119,8 @@ class EnrolmentSyncService:
                 error_message=str(exc),
             )
             raise
+        finally:
+            await self._storage.release_job_lock(job_name=job_name)
 
     async def _resolve_categories(self, category_id: int | None, max_categories: int | None) -> list[int]:
         if category_id is not None:
