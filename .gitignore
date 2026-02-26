@@ -20,6 +20,9 @@ docs/
 # Local run notes (can include internal operational context)
 20??_??_??.md
 
+# Supabase SQL export snippets (can include PII)
+supabase/sql/*.csv
+
 # Logs
 *.log
 

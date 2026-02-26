@@ -19,20 +19,8 @@
 ### 1) 통합 호출 (권장)
 
 ```powershell
-$body = @{
-  category_id = 303
-  trigger_type = "MANUAL"
-  max_categories = 1
-  max_users_per_course = 500
-  sheet_batch_size = 50
-  notification_batch_size = 50
-} | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:18080/jobs/ops/final-check" -ContentType "application/json" -Body (@{ category_id = 303; trigger_type = "MANUAL"; max_categories = 1; max_users_per_course = 500; sheet_batch_size = 50; notification_batch_size = 50 } | ConvertTo-Json)
 
-Invoke-RestMethod `
-  -Method Post `
-  -Uri "http://127.0.0.1:18080/jobs/ops/final-check" `
-  -ContentType "application/json" `
-  -Body $body
 ```
 
 ### 2) 분리 호출 (필요시)
