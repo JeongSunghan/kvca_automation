@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import hashlib
+import json
+import re
 from typing import Any, Protocol
 from urllib.parse import quote
 from uuid import uuid4
@@ -42,6 +45,16 @@ class PersistResult:
     alert_count: int
 
 
+@dataclass
+class OutboxDispatchResult:
+    picked: int = 0
+    processed: int = 0
+    sent: int = 0
+    failed: int = 0
+    skipped: int = 0
+    notification_enqueued: int = 0
+
+
 class Storage(Protocol):
     async def acquire_job_lock(self, job_name: str, ttl_seconds: int) -> bool: ...
 
@@ -51,6 +64,7 @@ class Storage(Protocol):
 
     async def finish_run(
         self,
+        job_name: str,
         run_id: int | None,
         success: bool,
         summary: dict[str, Any],
@@ -58,6 +72,10 @@ class Storage(Protocol):
     ) -> None: ...
 
     async def upsert_source_records(self, records: list[SourceRecordInput]) -> PersistResult: ...
+
+    async def dispatch_sheet_outbox(self, batch_size: int | None = None) -> OutboxDispatchResult: ...
+
+    async def dispatch_notification_outbox(self, batch_size: int | None = None) -> OutboxDispatchResult: ...
 
     async def aclose(self) -> None: ...
 
@@ -74,6 +92,7 @@ class NoopStorage:
 
     async def finish_run(
         self,
+        job_name: str,
         run_id: int | None,
         success: bool,
         summary: dict[str, Any],
@@ -88,6 +107,12 @@ class NoopStorage:
             changed_count=0,
             alert_count=0,
         )
+
+    async def dispatch_sheet_outbox(self, batch_size: int | None = None) -> OutboxDispatchResult:
+        return OutboxDispatchResult()
+
+    async def dispatch_notification_outbox(self, batch_size: int | None = None) -> OutboxDispatchResult:
+        return OutboxDispatchResult()
 
     async def aclose(self) -> None:
         return None
@@ -111,6 +136,15 @@ class SupabaseStorage:
         )
         self._alert_cooldown_minutes = max(0, settings.alert_cooldown_minutes)
         self._lock_owner = f"worker-{uuid4()}"
+        self._sheet_dispatch_batch_size = max(1, settings.sheet_dispatch_batch_size)
+        self._noti_dispatch_batch_size = max(1, settings.noti_dispatch_batch_size)
+        self._outbox_retry_base_seconds = max(1, settings.outbox_retry_base_seconds)
+        self._outbox_retry_max_seconds = max(self._outbox_retry_base_seconds, settings.outbox_retry_max_seconds)
+        self._sheet_webhook_url = settings.sheet_webhook_url
+        self._kakao_webhook_url = settings.kakao_webhook_url
+        self._kakao_template_code = settings.kakao_template_code
+        self._kakao_default_recipient = settings.kakao_default_recipient
+        self._dispatch_http = httpx.AsyncClient(timeout=timeout)
 
     async def acquire_job_lock(self, job_name: str, ttl_seconds: int) -> bool:
         now = _utc_now()
@@ -191,19 +225,35 @@ class SupabaseStorage:
 
     async def finish_run(
         self,
+        job_name: str,
         run_id: int | None,
         success: bool,
         summary: dict[str, Any],
         error_message: str | None = None,
     ) -> None:
+        failure_alert_count = 0
+        if not success:
+            failure_alert = self._build_run_failure_alert(
+                job_name=job_name,
+                run_id=run_id,
+                error_message=error_message,
+                summary=summary,
+            )
+            filtered = await self._filter_alert_rows_by_cooldown([failure_alert])
+            if filtered:
+                await self._insert_alerts(filtered)
+                failure_alert_count = len(filtered)
+
         if run_id is None:
             return
+
+        created_alerts = int(summary.get("created_alerts", 0)) + failure_alert_count
         payload = {
             "status": "SUCCESS" if success else "FAILED",
             "finished_at": _utc_now(),
             "total_records": int(summary.get("source_records_upserted", 0)),
             "changed_records": int(summary.get("changed_records", 0)),
-            "created_alerts": int(summary.get("created_alerts", 0)),
+            "created_alerts": created_alerts,
             "retry_count": int(summary.get("failed_detail_calls", 0)),
         }
         if error_message:
@@ -267,6 +317,78 @@ class SupabaseStorage:
             changed_count=business_diff_counts["CHANGED"],
             alert_count=len(alert_rows),
         )
+
+    async def dispatch_sheet_outbox(self, batch_size: int | None = None) -> OutboxDispatchResult:
+        limit = max(1, batch_size or self._sheet_dispatch_batch_size)
+        rows = await self._fetch_sheet_outbox_candidates(limit)
+        result = OutboxDispatchResult(picked=len(rows))
+        for row in rows:
+            row_id = _to_int(row.get("id"))
+            status = _to_str(row.get("status"))
+            if row_id is None or not status:
+                result.skipped += 1
+                continue
+            claimed = await self._claim_outbox_row("sheet_outbox", row_id=row_id, current_status=status)
+            if not claimed:
+                result.skipped += 1
+                continue
+            result.processed += 1
+            try:
+                payload = row.get("payload")
+                if not isinstance(payload, dict):
+                    payload = {}
+                await self._deliver_sheet_payload(payload)
+                enqueued = await self._enqueue_notification_from_sheet(row)
+                if enqueued:
+                    result.notification_enqueued += 1
+                await self._mark_outbox_sent("sheet_outbox", row_id=row_id)
+                result.sent += 1
+            except Exception as exc:
+                await self._mark_outbox_failed(
+                    "sheet_outbox",
+                    row_id=row_id,
+                    current_retry_count=_to_int(row.get("retry_count")) or 0,
+                    error_message=str(exc),
+                )
+                result.failed += 1
+        return result
+
+    async def dispatch_notification_outbox(self, batch_size: int | None = None) -> OutboxDispatchResult:
+        limit = max(1, batch_size or self._noti_dispatch_batch_size)
+        rows = await self._fetch_notification_outbox_candidates(limit)
+        result = OutboxDispatchResult(picked=len(rows))
+        for row in rows:
+            row_id = _to_int(row.get("id"))
+            status = _to_str(row.get("status"))
+            if row_id is None or not status:
+                result.skipped += 1
+                continue
+            claimed = await self._claim_outbox_row("notification_outbox", row_id=row_id, current_status=status)
+            if not claimed:
+                result.skipped += 1
+                continue
+            result.processed += 1
+            try:
+                payload = row.get("payload")
+                if not isinstance(payload, dict):
+                    payload = {}
+                await self._deliver_notification_payload(
+                    channel=_to_str(row.get("channel")) or "KAKAO_ALIMTALK",
+                    template_code=_to_str(row.get("template_code")) or self._kakao_template_code,
+                    recipient=_to_str(row.get("recipient")) or self._kakao_default_recipient,
+                    payload=payload,
+                )
+                await self._mark_outbox_sent("notification_outbox", row_id=row_id)
+                result.sent += 1
+            except Exception as exc:
+                await self._mark_outbox_failed(
+                    "notification_outbox",
+                    row_id=row_id,
+                    current_retry_count=_to_int(row.get("retry_count")) or 0,
+                    error_message=str(exc),
+                )
+                result.failed += 1
+        return result
 
     async def _fetch_existing_hashes(self, records: list[SourceRecordInput]) -> dict[tuple[str, str], str]:
         result: dict[tuple[str, str], str] = {}
@@ -415,6 +537,279 @@ class SupabaseStorage:
                 headers={"Prefer": "return=minimal"},
             )
             response.raise_for_status()
+        await self._enqueue_sheet_outbox(rows)
+
+    async def _enqueue_sheet_outbox(self, alert_rows: list[dict[str, Any]]) -> None:
+        if not alert_rows:
+            return
+        outbox_rows: list[dict[str, Any]] = []
+        for row in alert_rows:
+            source_type = _to_str(row.get("source_type"))
+            source_id = _to_str(row.get("source_id"))
+            alert_type = _to_str(row.get("alert_type"))
+            if not source_type or not source_id or not alert_type:
+                continue
+            row_key = _build_alert_row_key(row)
+            if await self._sheet_outbox_row_exists(row_key):
+                continue
+            outbox_rows.append(
+                {
+                    "source_type": source_type,
+                    "source_id": source_id,
+                    "row_key": row_key,
+                    "payload": {
+                        "source_type": source_type,
+                        "source_id": source_id,
+                        "alert_type": alert_type,
+                        "severity": _to_str(row.get("severity")) or "medium",
+                        "title": _to_str(row.get("title")),
+                        "message": _to_str(row.get("message")),
+                        "detail": row.get("detail") if isinstance(row.get("detail"), dict) else {},
+                    },
+                }
+            )
+        if not outbox_rows:
+            return
+        for chunk in _chunks(outbox_rows, 500):
+            response = await self._client.post(
+                "/sheet_outbox",
+                json=chunk,
+                headers={"Prefer": "return=minimal"},
+            )
+            response.raise_for_status()
+
+    async def _sheet_outbox_row_exists(self, row_key: str) -> bool:
+        query = (
+            "/sheet_outbox?"
+            "select=id&"
+            f"row_key=eq.{_encode_eq_value(row_key)}&"
+            "limit=1"
+        )
+        response = await self._client.get(query)
+        response.raise_for_status()
+        rows = response.json()
+        return isinstance(rows, list) and bool(rows)
+
+    async def _fetch_sheet_outbox_candidates(self, batch_size: int) -> list[dict[str, Any]]:
+        return await self._fetch_outbox_candidates(
+            table_name="sheet_outbox",
+            select_fields="id,source_type,source_id,row_key,payload,status,retry_count,next_retry_at,created_at,updated_at",
+            batch_size=batch_size,
+        )
+
+    async def _fetch_notification_outbox_candidates(self, batch_size: int) -> list[dict[str, Any]]:
+        return await self._fetch_outbox_candidates(
+            table_name="notification_outbox",
+            select_fields=(
+                "id,source_type,source_id,channel,template_code,recipient,payload,"
+                "status,retry_count,next_retry_at,created_at,updated_at"
+            ),
+            batch_size=batch_size,
+        )
+
+    async def _fetch_outbox_candidates(
+        self,
+        *,
+        table_name: str,
+        select_fields: str,
+        batch_size: int,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        rows.extend(
+            await self._query_outbox_rows(
+                table_name=table_name,
+                select_fields=select_fields,
+                status="PENDING",
+                extra_filters="order=created_at.asc",
+                limit=batch_size,
+            )
+        )
+        if len(rows) < batch_size:
+            remaining = batch_size - len(rows)
+            rows.extend(
+                await self._query_outbox_rows(
+                    table_name=table_name,
+                    select_fields=select_fields,
+                    status="FAILED",
+                    extra_filters="next_retry_at=is.null&order=updated_at.asc",
+                    limit=remaining,
+                )
+            )
+        if len(rows) < batch_size:
+            remaining = batch_size - len(rows)
+            now = _utc_now()
+            rows.extend(
+                await self._query_outbox_rows(
+                    table_name=table_name,
+                    select_fields=select_fields,
+                    status="FAILED",
+                    extra_filters=f"next_retry_at=lte.{_encode_eq_value(now)}&order=next_retry_at.asc",
+                    limit=remaining,
+                )
+            )
+        # Deduplicate by id, keeping the first order.
+        deduped: list[dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        for row in rows:
+            row_id = _to_int(row.get("id"))
+            if row_id is None:
+                continue
+            if row_id in seen_ids:
+                continue
+            seen_ids.add(row_id)
+            deduped.append(row)
+        return deduped[:batch_size]
+
+    async def _query_outbox_rows(
+        self,
+        *,
+        table_name: str,
+        select_fields: str,
+        status: str,
+        extra_filters: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        query = (
+            f"/{table_name}?"
+            f"select={select_fields}&"
+            f"status=eq.{_encode_eq_value(status)}&"
+            f"{extra_filters}&"
+            f"limit={limit}"
+        )
+        response = await self._client.get(query)
+        response.raise_for_status()
+        rows = response.json()
+        if not isinstance(rows, list):
+            return []
+        return [row for row in rows if isinstance(row, dict)]
+
+    async def _claim_outbox_row(self, table_name: str, *, row_id: int, current_status: str) -> bool:
+        query = (
+            f"/{table_name}?"
+            f"id=eq.{row_id}&"
+            f"status=eq.{_encode_eq_value(current_status)}&"
+            "select=id"
+        )
+        response = await self._client.patch(
+            query,
+            json={
+                "status": "PROCESSING",
+                "last_attempt_at": _utc_now(),
+            },
+            headers={"Prefer": "return=representation"},
+        )
+        response.raise_for_status()
+        rows = response.json()
+        return isinstance(rows, list) and bool(rows)
+
+    async def _mark_outbox_sent(self, table_name: str, *, row_id: int) -> None:
+        response = await self._client.patch(
+            f"/{table_name}?id=eq.{row_id}",
+            json={
+                "status": "SENT",
+                "last_error": None,
+                "next_retry_at": None,
+                "last_attempt_at": _utc_now(),
+            },
+        )
+        response.raise_for_status()
+
+    async def _mark_outbox_failed(
+        self,
+        table_name: str,
+        *,
+        row_id: int,
+        current_retry_count: int,
+        error_message: str,
+    ) -> None:
+        next_retry_count = current_retry_count + 1
+        delay_seconds = min(
+            self._outbox_retry_base_seconds * (2 ** max(0, current_retry_count)),
+            self._outbox_retry_max_seconds,
+        )
+        response = await self._client.patch(
+            f"/{table_name}?id=eq.{row_id}",
+            json={
+                "status": "FAILED",
+                "retry_count": next_retry_count,
+                "last_error": error_message[:1000],
+                "last_attempt_at": _utc_now(),
+                "next_retry_at": _utc_after(seconds=delay_seconds),
+            },
+        )
+        response.raise_for_status()
+
+    async def _deliver_sheet_payload(self, payload: dict[str, Any]) -> None:
+        if not self._sheet_webhook_url:
+            return
+        response = await self._dispatch_http.post(self._sheet_webhook_url, json=payload)
+        response.raise_for_status()
+
+    async def _deliver_notification_payload(
+        self,
+        *,
+        channel: str,
+        template_code: str,
+        recipient: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if not self._kakao_webhook_url:
+            return
+        body = {
+            "channel": channel,
+            "template_code": template_code,
+            "recipient": recipient,
+            "payload": payload,
+        }
+        response = await self._dispatch_http.post(self._kakao_webhook_url, json=body)
+        response.raise_for_status()
+
+    async def _enqueue_notification_from_sheet(self, sheet_row: dict[str, Any]) -> bool:
+        row_key = _to_str(sheet_row.get("row_key"))
+        if not row_key:
+            return False
+        if await self._notification_outbox_exists(row_key):
+            return False
+        payload = sheet_row.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        response = await self._client.post(
+            "/notification_outbox",
+            json={
+                "source_type": "sheet_alert",
+                "source_id": row_key,
+                "channel": "KAKAO_ALIMTALK",
+                "template_code": self._kakao_template_code,
+                "recipient": self._kakao_default_recipient,
+                "payload": {
+                    "row_key": row_key,
+                    "sheet_outbox_id": _to_int(sheet_row.get("id")),
+                    "source_type": _to_str(sheet_row.get("source_type")),
+                    "source_id": _to_str(sheet_row.get("source_id")),
+                    "alert": payload,
+                },
+            },
+            headers={"Prefer": "return=minimal"},
+        )
+        response.raise_for_status()
+        return True
+
+    async def _notification_outbox_exists(self, row_key: str) -> bool:
+        query = (
+            "/notification_outbox?"
+            "select=id&"
+            "source_type=eq.sheet_alert&"
+            f"source_id=eq.{_encode_eq_value(row_key)}&"
+            f"template_code=eq.{_encode_eq_value(self._kakao_template_code)}&"
+            f"recipient=eq.{_encode_eq_value(self._kakao_default_recipient)}&"
+            "limit=1"
+        )
+        response = await self._client.get(query)
+        response.raise_for_status()
+        rows = response.json()
+        return isinstance(rows, list) and bool(rows)
 
     async def _filter_alert_rows_by_cooldown(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if self._alert_cooldown_minutes <= 0 or not rows:
@@ -461,6 +856,53 @@ class SupabaseStorage:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+        await self._dispatch_http.aclose()
+
+    def _build_run_failure_alert(
+        self,
+        *,
+        job_name: str,
+        run_id: int | None,
+        error_message: str | None,
+        summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        error_group, http_status_code = _classify_run_failure(error_message)
+        severity = _determine_failure_severity(error_group)
+        source_id = f"{job_name}:{error_group}"
+        message = (
+            f"{job_name} failed "
+            f"group={error_group} "
+            f"http={http_status_code if http_status_code is not None else '-'}"
+        )
+        return {
+            "source_type": "run_log",
+            "source_id": source_id,
+            "alert_type": "FAILED",
+            "severity": severity,
+            "title": f"{job_name} run failed",
+            "message": message,
+            "detail": {
+                "job_name": job_name,
+                "run_id": run_id,
+                "error_group": error_group,
+                "http_status_code": http_status_code,
+                "error_message": (error_message or "")[:1500],
+                "summary": {
+                    "categories_processed": int(summary.get("categories_processed", 0)),
+                    "courses_processed": int(summary.get("courses_processed", 0)),
+                    "status_rows_processed": int(summary.get("status_rows_processed", 0)),
+                    "details_processed": int(summary.get("details_processed", 0)),
+                    "source_records_upserted": int(summary.get("source_records_upserted", 0)),
+                    "new_records": int(summary.get("new_records", 0)),
+                    "changed_records": int(summary.get("changed_records", 0)),
+                    "created_alerts": int(summary.get("created_alerts", 0)),
+                    "failed_detail_calls": int(summary.get("failed_detail_calls", 0)),
+                    "failed_course_calls": int(summary.get("failed_course_calls", 0)),
+                },
+            },
+            "review_status": "AUTO",
+            "resolved": False,
+        }
 
 
 def create_storage(settings: Settings) -> Storage:
@@ -506,6 +948,81 @@ def _determine_severity(alert_type: str, status: str | None, is_paid: bool, is_d
     if status == "DS":
         return "low"
     return "medium"
+
+
+def _extract_http_status_code(error_message: str | None) -> int | None:
+    if not error_message:
+        return None
+    typed_match = re.search(r"(?:Client|Server) error '([45]\d{2})", error_message)
+    if typed_match:
+        return int(typed_match.group(1))
+    fallback_match = re.search(r"\b([45]\d{2})\b", error_message)
+    if fallback_match:
+        return int(fallback_match.group(1))
+    return None
+
+
+def _classify_run_failure(error_message: str | None) -> tuple[str, int | None]:
+    text = (error_message or "").lower()
+    if "job_lock active" in text:
+        return ("LOCK_CONFLICT", 409)
+    status_code = _extract_http_status_code(error_message)
+    if status_code == 409:
+        return ("HTTP_409", status_code)
+    if status_code is not None and 500 <= status_code <= 599:
+        return ("HTTP_5XX", status_code)
+    if status_code is not None and 400 <= status_code <= 499:
+        return ("HTTP_4XX", status_code)
+    if "timeout" in text or "timed out" in text:
+        return ("TIMEOUT", None)
+    return ("UNKNOWN", status_code)
+
+
+def _determine_failure_severity(error_group: str) -> str:
+    if error_group in {"HTTP_5XX", "TIMEOUT"}:
+        return "high"
+    if error_group in {"HTTP_409", "HTTP_4XX"}:
+        return "medium"
+    if error_group == "LOCK_CONFLICT":
+        return "low"
+    return "medium"
+
+
+def _build_alert_row_key(alert_row: dict[str, Any]) -> str:
+    source_type = _to_str(alert_row.get("source_type")) or "unknown"
+    source_id = _to_str(alert_row.get("source_id")) or "unknown"
+    alert_type = _to_str(alert_row.get("alert_type")) or "UNKNOWN"
+    raw = json.dumps(
+        {
+            "source_type": source_type,
+            "source_id": source_id,
+            "alert_type": alert_type,
+            "title": _to_str(alert_row.get("title")),
+            "message": _to_str(alert_row.get("message")),
+            "detail": alert_row.get("detail") if isinstance(alert_row.get("detail"), dict) else {},
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"{source_type}:{source_id}:{alert_type}:{digest}"
+
+
+def _to_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
 
 
 def _encode_eq_value(value: str) -> str:

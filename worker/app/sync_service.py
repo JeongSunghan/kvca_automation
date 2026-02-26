@@ -38,18 +38,26 @@ class EnrolmentSyncService:
     async def sync(
         self,
         category_id: int | None,
+        trigger_type: str,
         max_categories: int | None,
         max_users_per_course: int | None,
         lock_ttl_seconds: int,
     ) -> SyncSummary:
         summary = SyncSummary(started_at=_utc_now())
         job_name = "enrolment_sync"
+        run_id = await self._storage.start_run(job_name=job_name, trigger_type=trigger_type)
         lock_acquired = await self._storage.acquire_job_lock(job_name=job_name, ttl_seconds=lock_ttl_seconds)
         summary.lock_acquired = lock_acquired
         if not lock_acquired:
+            summary.finished_at = _utc_now()
+            await self._storage.finish_run(
+                job_name=job_name,
+                run_id=run_id,
+                success=False,
+                summary=summary_to_dict(summary),
+                error_message="Job is already running (job_lock active).",
+            )
             raise RuntimeError("Job is already running (job_lock active).")
-
-        run_id = await self._storage.start_run(job_name=job_name, trigger_type="MANUAL")
 
         try:
             categories = await self._resolve_categories(category_id, max_categories)
@@ -104,6 +112,7 @@ class EnrolmentSyncService:
             summary.created_alerts = persist_result.alert_count
             summary.finished_at = _utc_now()
             await self._storage.finish_run(
+                job_name=job_name,
                 run_id=run_id,
                 success=True,
                 summary=summary_to_dict(summary),
@@ -113,6 +122,7 @@ class EnrolmentSyncService:
         except Exception as exc:
             summary.finished_at = _utc_now()
             await self._storage.finish_run(
+                job_name=job_name,
                 run_id=run_id,
                 success=False,
                 summary=summary_to_dict(summary),
@@ -120,7 +130,8 @@ class EnrolmentSyncService:
             )
             raise
         finally:
-            await self._storage.release_job_lock(job_name=job_name)
+            if lock_acquired:
+                await self._storage.release_job_lock(job_name=job_name)
 
     async def _resolve_categories(self, category_id: int | None, max_categories: int | None) -> list[int]:
         if category_id is not None:
@@ -155,7 +166,7 @@ class EnrolmentSyncService:
         user_id = _to_str(user.get("userId") or user.get("email"))
         if not user_id:
             return None
-        source_id = f"{term_id}:{user_id}"
+        source_id = _build_status_source_id(term_id=term_id, course_id=course_id, user_id=user_id)
         payload = redact_sensitive(row)
         return SourceRecordInput(
             source_type="enrolment_status",
@@ -214,6 +225,12 @@ class EnrolmentSyncService:
 def _hash_payload(payload: dict[str, Any]) -> str:
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _build_status_source_id(*, term_id: int, course_id: int, user_id: str) -> str:
+    # Final key decision:
+    # - enrolment_status: termId:courseId:userId (avoid collision across multi-course term)
+    return f"{term_id}:{course_id}:{user_id}"
 
 
 def _to_int(value: Any) -> int | None:

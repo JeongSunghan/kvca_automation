@@ -27,6 +27,14 @@ def _read_optional_int(name: str) -> int | None:
     return int(raw)
 
 
+def _read_optional_str(name: str) -> str | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    text = raw.strip()
+    return text if text else None
+
+
 def _load_env_file() -> None:
     candidates: list[Path] = []
     explicit = os.getenv("KVCA_ENV_FILE")
@@ -81,6 +89,14 @@ class Settings:
     supabase_request_timeout_ms: int
     alert_cooldown_minutes: int
     job_lock_ttl_seconds: int
+    sheet_dispatch_batch_size: int
+    noti_dispatch_batch_size: int
+    outbox_retry_base_seconds: int
+    outbox_retry_max_seconds: int
+    sheet_webhook_url: str | None
+    kakao_webhook_url: str | None
+    kakao_template_code: str
+    kakao_default_recipient: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -105,4 +121,12 @@ class Settings:
             supabase_request_timeout_ms=int(os.getenv("SUPABASE_REQUEST_TIMEOUT_MS", "15000")),
             alert_cooldown_minutes=int(os.getenv("ALERT_COOLDOWN_MINUTES", "30")),
             job_lock_ttl_seconds=int(os.getenv("JOB_LOCK_TTL_SECONDS", "900")),
+            sheet_dispatch_batch_size=int(os.getenv("SHEET_DISPATCH_BATCH_SIZE", "50")),
+            noti_dispatch_batch_size=int(os.getenv("NOTI_DISPATCH_BATCH_SIZE", "50")),
+            outbox_retry_base_seconds=int(os.getenv("OUTBOX_RETRY_BASE_SECONDS", "60")),
+            outbox_retry_max_seconds=int(os.getenv("OUTBOX_RETRY_MAX_SECONDS", "3600")),
+            sheet_webhook_url=_read_optional_str("SHEET_WEBHOOK_URL"),
+            kakao_webhook_url=_read_optional_str("KAKAO_WEBHOOK_URL"),
+            kakao_template_code=os.getenv("KAKAO_TEMPLATE_CODE", "KVCA_ALERT"),
+            kakao_default_recipient=os.getenv("KAKAO_DEFAULT_RECIPIENT", "ops"),
         )
